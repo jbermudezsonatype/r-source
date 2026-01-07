@@ -857,13 +857,25 @@ download.packages <- function(pkgs, destdir, available = NULL,
 
                 if (is.null(bulkdown)) {
                     # serial download
-                    res <- try(download.file(url, destfile, method, mode = "wb",
-                                             ...))
+                    # Capture warnings from C-level (which may contain RFC 9457 error messages)
+                    captured_warning <- NULL
+                    res <- withCallingHandlers(
+                        try(download.file(url, destfile, method, mode = "wb", ...)),
+                        warning = function(w) {
+                            captured_warning <<- conditionMessage(w)
+                            invokeRestart("muffleWarning")
+                        }
+                    )
                     if(!inherits(res, "try-error") && res == 0L)
                         retval <- rbind(retval, c(p, destfile))
-                    else
+                    else {
                         warning(gettextf("download of package %s failed", sQuote(p)),
                                 domain = NA, immediate. = TRUE)
+                        # Immediately follow with detailed C-level warning if available
+                        if (!is.null(captured_warning) && nzchar(captured_warning)) {
+                            warning(captured_warning, domain = NA, immediate. = TRUE, call. = FALSE)
+                        }
+                    }
                 } else
                     bulkdown <- rbind(bulkdown, c(p, destfile, url))
             }
@@ -876,23 +888,47 @@ download.packages <- function(pkgs, destdir, available = NULL,
         destfiles <- bulkdown[,2]
         ps <- bulkdown[,1]
 
-        res <- try(download.file(urls, destfiles, "libcurl", mode = "wb", ...))
+        # Capture warnings from C-level (which may contain RFC 9457 error messages)
+        captured_warnings <- list()
+        res <- withCallingHandlers(
+            try(download.file(urls, destfiles, "libcurl", mode = "wb", ...)),
+            warning = function(w) {
+                captured_warnings[[length(captured_warnings) + 1L]] <<- conditionMessage(w)
+                invokeRestart("muffleWarning")
+            }
+        )
+
         if(!inherits(res, "try-error") && res == 0L) {
             if (length(urls) > 1) {
                 retvals <- attr(res, "retvals")
+                warning_idx <- 0L  # Track which captured warning to use
                 for(i in seq_along(retvals)) {
                     if (retvals[i] == 0L)
                         retval <- rbind(retval, c(ps[i], destfiles[i]))
-                    else
+                    else {
+                        warning_idx <- warning_idx + 1L
+                        # Always show generic message for package-level context
                         warning(gettextf("download of package %s failed",
                                 sQuote(ps[i])), domain = NA, immediate. = TRUE)
+                        # Immediately follow with detailed C-level warning if available (with RFC 9457 details)
+                        if (length(captured_warnings) >= warning_idx && nzchar(captured_warnings[[warning_idx]])) {
+                            warning(captured_warnings[[warning_idx]], domain = NA, immediate. = TRUE, call. = FALSE)
+                        }
+                    }
                 }
             } else
                 retval <- rbind(retval, c(ps, destfiles))
-        } else
-            for(p in ps)
-                warning(gettextf("download of package %s failed", sQuote(p)),
+        } else {
+            # Show generic message followed immediately by detailed warning for each package
+            for(i in seq_along(ps)) {
+                warning(gettextf("download of package %s failed", sQuote(ps[i])),
                         domain = NA, immediate. = TRUE)
+                # Immediately follow with detailed C-level warning if available
+                if (length(captured_warnings) >= i && nzchar(captured_warnings[[i]])) {
+                    warning(captured_warnings[[i]], domain = NA, immediate. = TRUE, call. = FALSE)
+                }
+            }
+        }
     }
 
     retval
