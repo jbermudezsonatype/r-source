@@ -11,8 +11,8 @@ R_HOME = $(top_builddir)
 
 include $(top_builddir)/Makeconf
 
-SOURCES = Rhttpd.c Rsock.c internet.c libcurl.c sock.c sockconn.c
-HEADERS = sock.h
+SOURCES = Rhttpd.c Rsock.c internet.c libcurl.c sock.c sockconn.c http_utils.c json_utils.c rfc9457.c
+HEADERS = sock.h http_utils.h json_utils.h rfc9457.h
 DEPENDS = $(SOURCES:.c=.d)
 OBJECTS = $(SOURCES:.c=.o)
 

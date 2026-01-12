@@ -34,6 +34,9 @@
 
 #ifdef HAVE_LIBCURL
 # include <curl/curl.h>
+# include "http_utils.h"
+# include "json_utils.h"
+# include "rfc9457.h"
 /*
   This needed libcurl >= 7.28.0 (Oct 2012) for curl_multi_wait.
   Substitute code is provided for a Unix-alike only.
@@ -125,18 +128,16 @@ attribute_hidden SEXP in_do_curlVersion(SEXP call, SEXP op, SEXP args, SEXP rho)
 
 #ifdef HAVE_LIBCURL
 
-/* Per-URL context for storing RFC 9457 error responses */
-typedef struct {
-    char error_body[4097];      /* Raw response body (4KB + null terminator) */
-    char content_type[256];     /* Content-Type header value */
-    size_t body_length;         /* Actual body length received */
-    int has_error_body;         /* 0 = no body, 1 = has body */
-    int is_rfc9457;             /* 0 = not RFC 9457, 1 = RFC 9457 JSON */
-
-    char title[257];            /* RFC 9457 "title" field */
-    char detail[513];           /* RFC 9457 "detail" field (most important) */
-    long status;                /* HTTP status from actual response */
-} rfc9457_error_context;
+/* ========== RFC 9457 Integration Layer ========== */
+/*
+ * This section implements RFC 9457 "Problem Details for HTTP APIs" support
+ * using modular components:
+ * - http_utils.h: HTTP body capture and status checking
+ * - json_utils.h: JSON parsing
+ *
+ * The RFC 9457 layer orchestrates these components to parse structured
+ * error responses with Content-Type: application/problem+json
+ */
 
 /* Write context for smart body routing (success to file, error to buffer) */
 typedef struct {
@@ -212,125 +213,17 @@ static const char *ftp_errstr(const long status)
     return str;
 }
 
-/* ===== RFC 9457 JSON Parsing Functions ===== */
-
-/*
- * Extract a string field from JSON.
- * Looks for "field_name": "value" pattern.
- * Returns 1 if found and extracted, 0 otherwise.
- */
-static int extract_json_string_field(const char *json, const char *field_name,
-                                      char *output, size_t output_size)
-{
-    if (!json || !field_name || !output || output_size == 0) return 0;
-
-    /* Look for "field_name" - search for exact field match */
-    char search_pattern[128];
-    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", field_name);
-    size_t pattern_len = strlen(search_pattern);
-
-    const char *field_pos = json;
-    const char *colon_pos = NULL;
-    const char *value_start = NULL;
-
-    while ((field_pos = strstr(field_pos, search_pattern)) != NULL) {
-        /* Ensure the quote before field_name starts a new key
-           Check that it's preceded by: {, comma, or whitespace */
-        if (field_pos == json || field_pos[-1] == '{' || field_pos[-1] == ',' ||
-            field_pos[-1] == ' ' || field_pos[-1] == '\t' ||
-            field_pos[-1] == '\n' || field_pos[-1] == '\r') {
-            /* Found valid field, now look for colon */
-            colon_pos = strchr(field_pos + pattern_len, ':');
-            if (colon_pos) {
-                /* Found colon, skip whitespace after it */
-                value_start = colon_pos + 1;
-                while (*value_start == ' ' || *value_start == '\t' ||
-                       *value_start == '\n' || *value_start == '\r') {
-                    value_start++;
-                }
-                /* Check if value is a string (starts with ") */
-                if (*value_start == '"') {
-                    value_start++; /* Skip opening quote */
-                    break; /* Found our field */
-                }
-            }
-        }
-        field_pos += pattern_len;
-    }
-
-    if (!value_start || value_start[-1] != '"') return 0; /* Field not found or not a string */
-
-    /* Copy until closing quote (handling escaped quotes) */
-    size_t i = 0;
-    int escaped = 0;
-    while (i < output_size - 1 && *value_start != '\0') {
-        if (escaped) {
-            /* Handle simple escapes */
-            switch (*value_start) {
-                case 'n': output[i++] = '\n'; break;
-                case 't': output[i++] = '\t'; break;
-                case 'r': output[i++] = '\r'; break;
-                case '"': output[i++] = '"'; break;
-                case '\\': output[i++] = '\\'; break;
-                default: output[i++] = *value_start;
-            }
-            escaped = 0;
-        } else if (*value_start == '\\') {
-            escaped = 1;
-        } else if (*value_start == '"') {
-            /* Found closing quote */
-            output[i] = '\0';
-            return 1;
-        } else {
-            output[i++] = *value_start;
-        }
-        value_start++;
-    }
-
-    output[i] = '\0';
-    return 0; /* Didn't find closing quote */
-}
-
-/*
- * Parse RFC 9457 "Problem Details" error body.
- * Extracts title and detail fields for user-friendly error messages.
- * Returns 1 if RFC 9457 format detected and parsed, 0 otherwise.
- */
-static int parse_rfc9457_error(rfc9457_error_context *ctx)
-{
-    if (!ctx || !ctx->has_error_body || ctx->body_length == 0) return 0;
-
-    /* Check Content-Type for application/problem+json
-       Match at start or after whitespace/semicolon to handle:
-       - "application/problem+json"
-       - "application/problem+json; charset=utf-8"
-       But not:  "text/application/problem+json" */
-    const char *ct = ctx->content_type;
-    const char *match = strstr(ct, "application/problem+json");
-    if (!match || (match != ct && match[-1] != ' ' && match[-1] != '\t')) {
-        /* Not RFC 9457 format - ignore body and fall back to standard message */
-        ctx->is_rfc9457 = 0;
-        return 0;
-    }
-
-    ctx->is_rfc9457 = 1;
-
-    /* Extract "detail" field (most important for users) */
-    int has_detail = extract_json_string_field(ctx->error_body, "detail",
-                                                ctx->detail, sizeof(ctx->detail));
-
-    /* Extract "title" field (fallback if no detail) */
-    int has_title = extract_json_string_field(ctx->error_body, "title",
-                                               ctx->title, sizeof(ctx->title));
-
-    return (has_detail || has_title) ? 1 : 0;
-}
-
 /* Smart write callback that routes response bodies based on HTTP status.
    For success responses (< 400), writes to destination file.
    For error responses (>= 400), captures to error buffer for RFC 9457 parsing.
    This allows us to replicate CURLOPT_FAILONERROR behavior while still
-   capturing error response bodies. */
+   capturing error response bodies.
+
+   Uses http_utils for status checking and body capture:
+   - http_get_status(): Get HTTP status code
+   - http_is_error_status(): Check if status indicates error
+   - http_capture_content_type(): Capture Content-Type header
+   - http_capture_body_to_buffer(): Capture response body */
 static size_t
 smart_rcvBody(void *buffer, size_t size, size_t nmemb, void *userp)
 {
@@ -341,28 +234,19 @@ smart_rcvBody(void *buffer, size_t size, size_t nmemb, void *userp)
 
     /* On first body chunk, determine routing based on HTTP status */
     if (!ctx->body_started) {
-        long http_status = 0;
-        char *content_type = NULL;
+        long http_status = http_get_status(ctx->curl_handle);
+        ctx->error_ctx->status = http_status;
 
-        /* Get HTTP status code */
-        if (curl_easy_getinfo(ctx->curl_handle, CURLINFO_RESPONSE_CODE,
-                              &http_status) == CURLE_OK) {
-            ctx->error_ctx->status = http_status;
+        /* Determine if this is an error response */
+        if (http_is_error_status(http_status)) {
+            ctx->is_error_response = 1;
 
-            /* Determine if this is an error response */
-            if (http_status >= 400) {
-                ctx->is_error_response = 1;
-
-                /* Capture Content-Type header for RFC 9457 detection */
-                if (curl_easy_getinfo(ctx->curl_handle, CURLINFO_CONTENT_TYPE,
-                                      &content_type) == CURLE_OK && content_type) {
-                    strncpy(ctx->error_ctx->content_type, content_type,
-                            sizeof(ctx->error_ctx->content_type) - 1);
-                    ctx->error_ctx->content_type[sizeof(ctx->error_ctx->content_type) - 1] = '\0';
-                }
-            } else {
-                ctx->is_error_response = 0;
+            /* Capture Content-Type header using generic function */
+            if (ctx->error_ctx->response_body) {
+                http_capture_content_type(ctx->curl_handle, ctx->error_ctx->response_body);
             }
+        } else {
+            ctx->is_error_response = 0;
         }
 
         ctx->body_started = 1;
@@ -370,19 +254,10 @@ smart_rcvBody(void *buffer, size_t size, size_t nmemb, void *userp)
 
     /* Route to appropriate destination */
     if (ctx->is_error_response) {
-        /* Error response: capture to buffer */
-        size_t space_left = sizeof(ctx->error_ctx->error_body) -
-                            ctx->error_ctx->body_length - 1;
-
-        if (space_left > 0) {
-            size_t copy_size = (total_size < space_left) ? total_size : space_left;
-            memcpy(ctx->error_ctx->error_body + ctx->error_ctx->body_length,
-                   buffer, copy_size);
-            ctx->error_ctx->body_length += copy_size;
-            ctx->error_ctx->error_body[ctx->error_ctx->body_length] = '\0';
-            ctx->error_ctx->has_error_body = 1;
+        /* Error response: capture to buffer using generic function */
+        if (ctx->error_ctx->response_body) {
+            return http_capture_body_to_buffer(buffer, size, nmemb, ctx->error_ctx->response_body);
         }
-        /* Always return total_size even if buffer full (accept all data) */
         return total_size;
     } else {
         /* Success response: write to file */
@@ -420,7 +295,7 @@ static void download_report_url_error(CURLMsg *msg, rfc9457_error_context *error
 	}
 
 	/* Check for RFC 9457 error details */
-	if (error_ctx && error_ctx->has_error_body && error_ctx->is_rfc9457) {
+	if (error_ctx && error_ctx->response_body && error_ctx->response_body->has_body && error_ctx->is_rfc9457) {
 	    /* RFC 9457 structured error */
 	    if (error_ctx->detail[0] != '\0') {
 		/* Show detail as primary message */
@@ -458,6 +333,8 @@ static void download_report_url_error(CURLMsg *msg, rfc9457_error_context *error
 	    warning(_("URL '%s': status was '%s'"), url, strerr);
     }
 }
+
+/* ========== End RFC 9457 Integration Layer ========== */
 
 /*
   Check curl_multi_info_read for errors, reporting as warnings
@@ -869,7 +746,7 @@ static void download_cleanup_url(int i, download_cleanup_info *c)
 	c->write_ctxs[i] = NULL;
     }
     if (c->error_ctxs && c->error_ctxs[i]) {
-	free(c->error_ctxs[i]);
+	rfc9457_free_context(c->error_ctxs[i]);
 	c->error_ctxs[i] = NULL;
     }
 }
@@ -956,7 +833,7 @@ static int download_add_url(int i, SEXP scmd, const char *mode,
 # endif
 #endif
     /* Allocate and initialize RFC 9457 error context */
-    c->error_ctxs[i] = (rfc9457_error_context *)calloc(1, sizeof(rfc9457_error_context));
+    c->error_ctxs[i] = rfc9457_create_context();
     if (!c->error_ctxs[i]) {
 	fclose(c->out[i]);
 	c->out[i] = NULL;
@@ -971,7 +848,8 @@ static int download_add_url(int i, SEXP scmd, const char *mode,
     /* Allocate and initialize write context for smart body routing */
     c->write_ctxs[i] = (url_write_context *)calloc(1, sizeof(url_write_context));
     if (!c->write_ctxs[i]) {
-	free(c->error_ctxs[i]);
+	/* Clean up error context */
+	rfc9457_free_context(c->error_ctxs[i]);
 	c->error_ctxs[i] = NULL;
 	fclose(c->out[i]);
 	c->out[i] = NULL;
@@ -1140,7 +1018,7 @@ static void download_close_finished(download_cleanup_info *c)
 	                          &http_status) == CURLE_OK && http_status >= 400) {
 		/* HTTP error response - parse RFC 9457 if available */
 		if (err_ctx) {
-		    parse_rfc9457_error(err_ctx);
+		    rfc9457_parse_error(err_ctx);
 		}
 		/* Report as error (replicating CURLOPT_FAILONERROR behavior) */
 		download_report_url_error(msg, err_ctx);
